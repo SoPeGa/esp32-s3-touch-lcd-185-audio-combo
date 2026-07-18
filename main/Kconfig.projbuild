@@ -1,0 +1,61 @@
+menu "Spotpear MP3 Radio"
+
+    config RADIO_WIFI_SSID
+        string "WiFi SSID"
+        default ""
+
+    config RADIO_WIFI_PASSWORD
+        string "WiFi password"
+        default ""
+
+    config RADIO_DEFAULT_STREAM_NAME
+        string "Default radio station name"
+        default "Internet Radio"
+
+    config RADIO_DEFAULT_STREAM_URL
+        string "Default radio stream URL"
+        default ""
+
+    config OPENAI_API_KEY
+        string "OpenAI API key"
+        default ""
+        help
+            Leave empty and put the key on the SD card instead
+            (/openai.txt with "key=sk-..."), so it is never committed.
+            A value set here is baked into the firmware binary.
+
+    config OPENAI_CHAT_MODEL
+        string "OpenAI chat model"
+        default "gpt-4.1-mini"
+
+    config OPENAI_TRANSCRIBE_MODEL
+        string "OpenAI speech to text model"
+        default "gpt-4o-mini-transcribe"
+
+    config OPENAI_TTS_MODEL
+        string "OpenAI text to speech model"
+        default "gpt-4o-mini-tts"
+
+    config AI_RECORD_SECONDS
+        int "AI record seconds"
+        default 5
+        range 2 15
+
+    config BATTERY_ADC_CHANNEL
+        int "Battery ADC1 channel (GPIO1=0, GPIO2=1, GPIO3=2 ...)"
+        default 0
+        range 0 9
+        help
+            ADC1 channel connected to the battery voltage divider.
+            Channel 0 = GPIO1 (default for Spotpear 1.28 BOX).
+            Verify with the board schematic.
+
+    config BATTERY_VOLTAGE_MULTIPLIER
+        int "Battery voltage divider multiplier (Vbat = Vadc * N)"
+        default 2
+        range 1 8
+        help
+            If the board has a 100k+100k resistor divider, Vbat = Vadc * 2
+            so set this to 2. Adjust if your divider ratio differs.
+
+endmenu

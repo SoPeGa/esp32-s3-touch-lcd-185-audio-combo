@@ -1,0 +1,23 @@
+cd C:\APPS\ESP32-S3-Touch-LCD-1.85-Audio-Combo
+idf.py build
+idf.py -p COM9 build flash monitor
+
+cd C:\APPS\ESP32-S3-Touch-LCD-1.85-Audio-Combo
+idf.py -B C:\build_185 -p COM9 flash
+idf.py -p COM9 flash monitor
+
+cd C:\APPS\ESP32-S3-Touch-LCD-1.85-Audio-Combo
+idf.py -B C:\build_185_metadata_ui -p COM9 flash monitor
+idf.py -B C:\build_185_stability_fix -p COM9 flash monitor
+idf.py -B C:\build_185_audio_transition_fix -p COM9 flash monitor
+idf.py -B C:\build_185_aac_adts_fix -p COM9 flash monitor
+idf.py -B C:\build_185_mp3_safety_fix -p COM9 flash monitor
+idf.py -B C:\build_185_radio_buffer_fix -p COM9 flash monitor
+
+
+
+cd C:\APPS\ESP32-S3-Touch-LCD-1.85-Audio-Combo
+idf.py -B build fullclean
+idf.py -B build build
+idf.py -B build -p COM9 flash
+idf.py -B build -p COM9 flash monitor
