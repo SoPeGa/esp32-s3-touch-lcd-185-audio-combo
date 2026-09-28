@@ -68,4 +68,5 @@ void    ui_show_notice(const char *text);   /* pill overlay, auto-hides after 8 
 /* clock screensaver overlay; backlight is handled by the app */
 void    ui_show_saver(bool show);
 bool    ui_saver_active(void);
+bool    ui_saver_take_wake(void);           /* true once after the saver was touched */
 void    ui_saver_update(const char *clock_str, const char *line1, const char *line2);

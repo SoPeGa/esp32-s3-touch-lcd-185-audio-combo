@@ -118,6 +118,7 @@ static char s_radio_station[96];
 static char s_radio_title[192];
 static volatile int s_web_volume = -1;
 static volatile int s_web_delete_index = -1;
+static volatile int s_web_station_delete_index = -1;
 static volatile uint8_t s_battery_cache = 255;
 static volatile uint32_t s_saver_timeout_ms = 30000;  /* 0 = screensaver disabled */
 static char s_sta_ip[20] = "";
@@ -133,6 +134,7 @@ enum {
     APP_ACTION_WEB_VOLUME,
     APP_ACTION_WEB_MP3_DELETE,
     APP_ACTION_WEB_RESCAN,
+    APP_ACTION_WEB_RADIO_DELETE,
 };
 static const char *const s_ai_voices[] = {"alloy", "nova", "shimmer", "echo", "fable", "onyx"};
 
@@ -141,6 +143,7 @@ static void ai_start_conversation(void);
 static void save_player_state(void);
 static void save_stations_to_nvs(void);
 static void ai_hist_reset(void);
+static esp_err_t delete_radio_station(int index);
 
 static char *trim(char *s)
 {
@@ -850,6 +853,25 @@ static void next_item(int dir)
 
 static void handle_action(int action)
 {
+    /* While an AI turn is in flight it owns the mic and will start the spoken answer:
+       starting other playback now would collide with it. */
+    if (s_ai_task) {
+        switch (action) {
+        case UI_ACTION_MODE_RADIO:
+        case UI_ACTION_MODE_MP3:
+        case UI_ACTION_MODE_AI:
+        case UI_ACTION_PREV:
+        case UI_ACTION_NEXT:
+        case UI_ACTION_OPEN_LIST:
+        case UI_ACTION_LIST_PICK:
+        case APP_ACTION_WEB_RADIO_PLAY:
+        case APP_ACTION_WEB_MP3_PLAY:
+        case APP_ACTION_WEB_RADIO_TEST:
+            return;
+        default:
+            break;
+        }
+    }
     switch (action) {
     case UI_ACTION_MODE_RADIO:
         if (s_mode != UI_MODE_RADIO) {
@@ -1017,6 +1039,9 @@ static void handle_action(int action)
     case APP_ACTION_WEB_RADIO_TEST:
         play_stream_url(s_web_test_name, s_web_test_url, true);
         break;
+    case APP_ACTION_WEB_RADIO_DELETE:
+        delete_radio_station(s_web_station_delete_index);
+        break;
     default:
         break;
     }
@@ -1057,6 +1082,72 @@ static void wav_write_header(FILE *f, uint32_t data_size)
     wav_write_u16(f, AI_RECORD_BITS);
     fwrite("data", 1, 4, f);
     wav_write_u32(f, data_size);
+}
+
+/* LVGL is not thread-safe: ai_task never touches widgets. It posts texts here and
+   app_loop applies them from the UI task. NULL leaves a field unchanged. */
+static portMUX_TYPE s_ai_ui_lock = portMUX_INITIALIZER_UNLOCKED;
+static struct {
+    char title[96];
+    char subtitle[256];
+    char status[40];
+    bool has_title, has_subtitle, has_status, has_playing;
+    bool playing;
+} s_ai_ui;
+static volatile bool s_ai_ui_dirty;
+
+static void ai_ui_post(const char *title, const char *subtitle, const char *status)
+{
+    portENTER_CRITICAL(&s_ai_ui_lock);
+    if (title) {
+        strlcpy(s_ai_ui.title, title, sizeof(s_ai_ui.title));
+        s_ai_ui.has_title = true;
+    }
+    if (subtitle) {
+        strlcpy(s_ai_ui.subtitle, subtitle, sizeof(s_ai_ui.subtitle));
+        s_ai_ui.has_subtitle = true;
+    }
+    if (status) {
+        strlcpy(s_ai_ui.status, status, sizeof(s_ai_ui.status));
+        s_ai_ui.has_status = true;
+    }
+    s_ai_ui_dirty = true;
+    portEXIT_CRITICAL(&s_ai_ui_lock);
+}
+
+static void ai_ui_post_playing(bool playing)
+{
+    portENTER_CRITICAL(&s_ai_ui_lock);
+    s_ai_ui.playing = playing;
+    s_ai_ui.has_playing = true;
+    s_ai_ui_dirty = true;
+    portEXIT_CRITICAL(&s_ai_ui_lock);
+}
+
+/* called from app_loop only */
+static void ai_ui_apply(void)
+{
+    if (!s_ai_ui_dirty) return;
+    static char title[sizeof(s_ai_ui.title)];
+    static char subtitle[sizeof(s_ai_ui.subtitle)];
+    static char status[sizeof(s_ai_ui.status)];
+    portENTER_CRITICAL(&s_ai_ui_lock);
+    bool has_title = s_ai_ui.has_title, has_subtitle = s_ai_ui.has_subtitle;
+    bool has_status = s_ai_ui.has_status, has_playing = s_ai_ui.has_playing;
+    bool playing = s_ai_ui.playing;
+    strlcpy(title, s_ai_ui.title, sizeof(title));
+    strlcpy(subtitle, s_ai_ui.subtitle, sizeof(subtitle));
+    strlcpy(status, s_ai_ui.status, sizeof(status));
+    s_ai_ui.has_title = s_ai_ui.has_subtitle = s_ai_ui.has_status = s_ai_ui.has_playing = false;
+    s_ai_ui_dirty = false;
+    portEXIT_CRITICAL(&s_ai_ui_lock);
+
+    if (s_mode != UI_MODE_AI) return;  /* user swiped away meanwhile: keep that page intact */
+    if (has_title) ui_set_title(title);
+    if (has_subtitle) ui_set_subtitle(subtitle);
+    if (has_status) ui_set_status(status);
+    if (has_playing) ui_set_playing(playing);
+    if (has_title || has_subtitle) set_now_strings(title[0] ? title : "Asistent AI", subtitle);
 }
 
 /* Voice-activity thresholds, as in AI_Voice_Assistant_IDF. */
@@ -1622,7 +1713,7 @@ static esp_err_t ai_chat_romanian(const char *question, char *answer, size_t ans
                     continue;
                 }
                 if (!next_root) {
-                    ui_set_subtitle("Verific pe internet...");
+                    ai_ui_post(NULL, "Verific pe internet...", NULL);
                     next_root = cJSON_CreateObject();
                     cJSON_AddStringToObject(next_root, "model", CONFIG_OPENAI_CHAT_MODEL);
                     cJSON_AddItemToObject(next_root, "tools", build_ai_tools());
@@ -1704,68 +1795,46 @@ static esp_err_t ai_tts_to_mp3(const char *text, const char *path)
     return ret;
 }
 
+/* Runs in its own task: network/audio work only, UI updates go through ai_ui_post(). */
 static void ai_task(void *arg)
 {
     (void)arg;
     char question[512] = {0};
     char answer[1024] = {0};
 
-    if (s_openai_api_key[0] == '\0') {
-        ui_set_title("Lipseste cheia API");
-        ui_set_subtitle("Pune openai.txt pe cardul SD");
-        ui_set_status("Eroare");
-        s_ai_task = NULL;
-        vTaskDelete(NULL);
-    }
-
-    stop_playback();
-    s_mode = UI_MODE_AI;
-    ui_set_mode(UI_MODE_AI);
-    ui_set_ai_phase(UI_AI_LISTENING);
-    ui_set_title("Ascult...");
-    ui_set_subtitle("Vorbeste - ma opresc cand faci pauza");
-    ui_set_status("Inregistrare");
     esp_err_t rec = ai_record_wav(AI_WAV_PATH);
     if (rec != ESP_OK) {
         ui_set_ai_phase(UI_AI_IDLE);
-        ui_set_title(rec == ESP_ERR_TIMEOUT ? "Nu am auzit nimic" : "Eroare microfon");
-        ui_set_subtitle(rec == ESP_ERR_TIMEOUT ? "Incearca din nou" : "");
-        ui_set_status(rec == ESP_ERR_TIMEOUT ? "Apasa microfonul" : "Eroare");
+        ai_ui_post(rec == ESP_ERR_TIMEOUT ? "Nu am auzit nimic" : "Eroare microfon",
+                   rec == ESP_ERR_TIMEOUT ? "Incearca din nou" : "",
+                   rec == ESP_ERR_TIMEOUT ? "Apasa microfonul" : "Eroare");
         s_ai_task = NULL;
         vTaskDelete(NULL);
     }
 
     ui_set_ai_phase(UI_AI_THINKING);
-    ui_set_title("Ma gandesc...");
-    ui_set_subtitle("Transcriu intrebarea");
-    ui_set_status("Transcriere");
+    ai_ui_post("Ma gandesc...", "Transcriu intrebarea", "Transcriere");
     if (ai_transcribe_wav(AI_WAV_PATH, question, sizeof(question)) != ESP_OK) {
         ui_set_ai_phase(UI_AI_IDLE);
-        ui_set_title("Eroare transcriere");
-        ui_set_status("Eroare");
+        ai_ui_post("Eroare transcriere", "", "Eroare");
         s_ai_task = NULL;
         vTaskDelete(NULL);
     }
 
-    ui_set_subtitle(question);
-    ui_set_status("AI");
+    ai_ui_post(NULL, question, "AI");
     if (ai_chat_romanian(question, answer, sizeof(answer)) != ESP_OK) {
         ui_set_ai_phase(UI_AI_IDLE);
-        ui_set_title("Eroare AI");
-        ui_set_status("Eroare");
+        ai_ui_post("Eroare AI", NULL, "Eroare");
         s_ai_task = NULL;
         vTaskDelete(NULL);
     }
     ai_hist_push(question, answer);
     ai_hist_log(question, answer);
 
-    ui_set_title("Vorbesc...");
-    ui_set_subtitle(s_ai_voices[s_ai_voice_index]);
-    ui_set_status("Sinteza vocala");
+    ai_ui_post("Vorbesc...", s_ai_voices[s_ai_voice_index], "Sinteza vocala");
     if (ai_tts_to_mp3(answer, AI_TTS_PATH) != ESP_OK) {
         ui_set_ai_phase(UI_AI_IDLE);
-        ui_set_title("Eroare TTS");
-        ui_set_status("Eroare");
+        ai_ui_post("Eroare TTS", NULL, "Eroare");
         s_ai_task = NULL;
         vTaskDelete(NULL);
     }
@@ -1775,25 +1844,43 @@ static void ai_task(void *arg)
         s_playing = true;
         s_paused = false;
         ui_set_ai_phase(UI_AI_SPEAKING);
-        ui_set_playing(true);
-        ui_set_status("Redare");
+        ai_ui_post_playing(true);
+        ai_ui_post(NULL, NULL, "Redare");
     } else {
         if (fp) {
             fclose(fp);
         }
         ui_set_ai_phase(UI_AI_IDLE);
-        ui_set_status("Eroare redare");
+        ai_ui_post(NULL, NULL, "Eroare redare");
     }
     s_ai_task = NULL;
     vTaskDelete(NULL);
 }
 
+/* Called from the UI task (handle_action), so it may touch LVGL directly. */
 static void ai_start_conversation(void)
 {
     if (s_ai_task) {
         return;
     }
-    xTaskCreatePinnedToCore(ai_task, "ai_task", 12288, NULL, 4, &s_ai_task, 1);
+    if (s_openai_api_key[0] == '\0') {
+        ui_set_title("Lipseste cheia API");
+        ui_set_subtitle("Seteaz-o din pagina web");
+        ui_set_status("Eroare");
+        return;
+    }
+    stop_playback();  /* also interrupts an answer that is still being spoken */
+    s_mode = UI_MODE_AI;
+    ui_set_mode(UI_MODE_AI);
+    ui_set_ai_phase(UI_AI_LISTENING);
+    ui_set_title("Ascult...");
+    ui_set_subtitle("Vorbeste - ma opresc cand faci pauza");
+    ui_set_status("Inregistrare");
+    if (xTaskCreatePinnedToCore(ai_task, "ai_task", 12288, NULL, 4, &s_ai_task, 1) != pdPASS) {
+        s_ai_task = NULL;
+        ui_set_ai_phase(UI_AI_IDLE);
+        ui_set_status("Eroare");
+    }
 }
 
 static void load_radio_stations(void)
@@ -2371,7 +2458,12 @@ static esp_err_t api_radio_test_handler(httpd_req_t *req)
     if (!has_url) {
         return send_json_error(req, "missing url");
     }
-    play_stream_url(name, url, true);
+    strlcpy(s_web_test_name, name, sizeof(s_web_test_name));
+    strlcpy(s_web_test_url, url, sizeof(s_web_test_url));
+    int action = APP_ACTION_WEB_RADIO_TEST;
+    if (xQueueSend(s_action_queue, &action, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return send_json_error(req, "command queue full");
+    }
     return send_json_ok(req);
 }
 
@@ -2401,8 +2493,17 @@ static esp_err_t api_radio_delete_handler(httpd_req_t *req)
     char body[64];
     char idx_text[12] = {0};
     ESP_RETURN_ON_ERROR(read_req_body(req, body, sizeof(body)), TAG, "radio delete body");
-    if (!form_get_value(body, "idx", idx_text, sizeof(idx_text)) || delete_radio_station(atoi(idx_text)) != ESP_OK) {
-        return send_json_error(req, "delete failed");
+    if (!form_get_value(body, "idx", idx_text, sizeof(idx_text))) {
+        return send_json_error(req, "missing index");
+    }
+    int idx = atoi(idx_text);
+    if (idx < 0 || idx >= s_station_count) {
+        return send_json_error(req, "bad index");
+    }
+    s_web_station_delete_index = idx;
+    int action = APP_ACTION_WEB_RADIO_DELETE;
+    if (xQueueSend(s_action_queue, &action, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return send_json_error(req, "command queue full");
     }
     return send_json_ok(req);
 }
@@ -3024,6 +3125,7 @@ static void app_loop(void)
         while (xQueueReceive(s_action_queue, &action, 0) == pdTRUE) {
             handle_action(action);
         }
+        ai_ui_apply();
 
         if (s_radio_metadata_dirty && s_mode == UI_MODE_RADIO) {
             char station[sizeof(s_radio_station)];
@@ -3085,10 +3187,14 @@ static void app_loop(void)
                 ui_show_notice(notice);
             }
 
-            /* Screensaver: dim + clock after the configured idle time (wake check runs every loop) */
+            /* Screensaver: dim + clock after the configured idle time. While the assistant
+               listens, thinks or speaks the idle timer is held at zero, so the countdown
+               only starts once the answer has finished. */
+            if (s_mode == UI_MODE_AI && (s_ai_task || s_playing)) {
+                lv_disp_trig_activity(NULL);
+            }
             uint32_t idle_ms = lv_disp_get_inactive_time(NULL);
-            if (!ui_saver_active() && s_saver_timeout_ms > 0 && idle_ms > s_saver_timeout_ms &&
-                !(s_mode == UI_MODE_AI && s_ai_task)) {
+            if (!ui_saver_active() && s_saver_timeout_ms > 0 && idle_ms > s_saver_timeout_ms) {
                 ui_show_saver(true);
                 Set_Backlight(10);
             }
@@ -3106,8 +3212,8 @@ static void app_loop(void)
             }
         }
 
-        /* Wake from screensaver immediately on touch */
-        if (ui_saver_active() && lv_disp_get_inactive_time(NULL) < 500) {
+        /* Wake from screensaver on touch (the touch itself is swallowed by the overlay) */
+        if (ui_saver_active() && ui_saver_take_wake()) {
             ui_show_saver(false);
             Set_Backlight(LCD_Backlight);
         }
@@ -3138,8 +3244,9 @@ static void app_loop(void)
             } else if (s_mode == UI_MODE_RADIO) {
                 ui_set_status("Reconectare");
                 play_current();
-            } else {
-                /* AI: TTS answer finished — back to idle, no auto-play */
+            } else if (!s_ai_task) {
+                /* AI: TTS answer finished — back to idle, no auto-play. When the mic
+                   interrupted the answer, a new turn is already listening: leave it be. */
                 ui_set_ai_phase(UI_AI_IDLE);
                 ui_set_status("Apasa microfonul");
             }

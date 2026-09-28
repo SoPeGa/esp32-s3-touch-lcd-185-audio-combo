@@ -44,6 +44,7 @@ static lv_obj_t *s_saver_line1;
 static lv_obj_t *s_saver_line2;
 static lv_obj_t *s_notice;
 static lv_timer_t *s_notice_timer;
+static bool s_saver_wake;
 static ui_action_cb_t s_action_cb;
 static ui_mode_t s_current_mode = UI_MODE_RADIO;
 static uint8_t s_arc_volume = 55;
@@ -715,6 +716,22 @@ void ui_show_notice(const char *text)
 
 /* ---- clock screensaver ---- */
 
+/* The wake touch must never reach the widgets underneath (the centre one is the
+   AI mic button): ignore the rest of this touch until the finger is lifted. */
+static void saver_pressed_cb(lv_event_t *e)
+{
+    (void)e;
+    lv_indev_wait_release(lv_indev_get_act());
+    s_saver_wake = true;
+}
+
+bool ui_saver_take_wake(void)
+{
+    bool wake = s_saver_wake;
+    s_saver_wake = false;
+    return wake;
+}
+
 void ui_show_saver(bool show)
 {
     if (show == (s_saver != NULL)) return;
@@ -724,8 +741,9 @@ void ui_show_saver(bool show)
         s_saver_clock = s_saver_line1 = s_saver_line2 = NULL;
         return;
     }
-    /* full-screen overlay: swallows the wake-up touch so nothing underneath is pressed */
+    s_saver_wake = false;
     s_saver = lv_obj_create(lv_scr_act());
+    lv_obj_add_event_cb(s_saver, saver_pressed_cb, LV_EVENT_PRESSED, NULL);
     lv_obj_set_size(s_saver, 360, 360);
     lv_obj_center(s_saver);
     lv_obj_set_style_radius(s_saver, 180, 0);
