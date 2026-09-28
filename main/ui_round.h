@@ -27,6 +27,7 @@ enum {
     UI_ACTION_VOL_SET,   /* arc drag — read ui_get_arc_volume() for value */
     UI_ACTION_OPEN_LIST, /* long-press — app builds the list and calls ui_show_picker() */
     UI_ACTION_LIST_PICK, /* picker confirmed — read ui_get_picked_index() */
+    UI_ACTION_AI_RESET,  /* long-press in AI mode — start a new conversation */
 };
 
 #define UI_BATTERY_UNKNOWN 255

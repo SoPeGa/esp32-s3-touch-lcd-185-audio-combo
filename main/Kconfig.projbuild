@@ -36,11 +36,6 @@ menu "Spotpear MP3 Radio"
         string "OpenAI text to speech model"
         default "gpt-4o-mini-tts"
 
-    config AI_RECORD_SECONDS
-        int "AI record seconds"
-        default 5
-        range 2 15
-
     config BATTERY_ADC_CHANNEL
         int "Battery ADC1 channel (GPIO1=0, GPIO2=1, GPIO3=2 ...)"
         default 0

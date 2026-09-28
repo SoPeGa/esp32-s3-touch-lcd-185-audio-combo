@@ -140,6 +140,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 static void ai_start_conversation(void);
 static void save_player_state(void);
 static void save_stations_to_nvs(void);
+static void ai_hist_reset(void);
 
 static char *trim(char *s)
 {
@@ -945,6 +946,16 @@ static void handle_action(int action)
         }
         break;
     }
+    case UI_ACTION_AI_RESET:
+        if (!s_ai_task) {
+            ai_hist_reset();
+            if (s_mode == UI_MODE_AI) {
+                ui_set_title("Conversatie noua");
+                ui_set_subtitle(s_ai_voices[s_ai_voice_index]);
+                ui_set_status("Apasa microfonul");
+            }
+        }
+        break;
     case APP_ACTION_WEB_MP3_DELETE: {
         int idx = s_web_delete_index;
         if (idx >= 0 && idx < s_track_count) {
@@ -1052,8 +1063,9 @@ static void wav_write_header(FILE *f, uint32_t data_size)
 #define AI_SPEECH_START_LEVEL     5     /* % of full scale to consider speech started */
 #define AI_SPEECH_CONTINUE_LEVEL  3     /* below this counts as silence */
 #define AI_START_TIMEOUT_MS       5000  /* give up if nobody speaks */
-#define AI_SILENCE_END_MS         1200  /* stop after this much trailing silence */
+#define AI_SILENCE_END_MS         1500  /* the question ends after this much trailing silence */
 #define AI_MIN_SPEECH_MS          1000
+#define AI_RECORD_MAX_MS          30000 /* safety cap only — silence detection is what normally stops it */
 
 static esp_err_t ai_record_wav(const char *path)
 {
@@ -1067,10 +1079,13 @@ static esp_err_t ai_record_wav(const char *path)
     }
     int16_t samples[512];
     const uint32_t chunk_ms = (512 * 1000U) / AI_RECORD_RATE;
-    const size_t bytes_max = (size_t)AI_RECORD_RATE * 2 * CONFIG_AI_RECORD_SECONDS;
+    const size_t bytes_max = (size_t)AI_RECORD_RATE * 2 * (AI_RECORD_MAX_MS / 1000);
     size_t bytes_total = 0;
     bool speech_started = false;
     uint32_t waited_ms = 0, silence_ms = 0, speech_ms = 0;
+    int noise_sum = 0, noise_chunks = 0;
+    int start_level = AI_SPEECH_START_LEVEL;
+    int continue_level = AI_SPEECH_CONTINUE_LEVEL;
 
     while (bytes_total < bytes_max) {
         size_t bytes_read = 0;
@@ -1087,10 +1102,17 @@ static esp_err_t ai_record_wav(const char *path)
         int level = (int)((peak * 100) / INT16_MAX);
 
         if (!speech_started) {
-            if (level >= AI_SPEECH_START_LEVEL) {
+            if (level >= start_level) {
                 speech_started = true;
-                ESP_LOGI(TAG, "AI: speech started");
+                ESP_LOGI(TAG, "AI: speech started (noise %d%%, silence below %d%%)",
+                         noise_chunks ? noise_sum / noise_chunks : 0, continue_level);
             } else {
+                /* learn the room's background level so pauses are detected above it */
+                noise_sum += level;
+                noise_chunks++;
+                int noise = noise_sum / noise_chunks;
+                start_level = noise + 3 > AI_SPEECH_START_LEVEL ? noise + 3 : AI_SPEECH_START_LEVEL;
+                continue_level = noise + 2 > AI_SPEECH_CONTINUE_LEVEL ? noise + 2 : AI_SPEECH_CONTINUE_LEVEL;
                 waited_ms += chunk_ms;
                 if (waited_ms >= AI_START_TIMEOUT_MS) break;
                 continue;
@@ -1099,7 +1121,7 @@ static esp_err_t ai_record_wav(const char *path)
         fwrite(samples, 1, bytes_read, f);
         bytes_total += bytes_read;
         speech_ms += chunk_ms;
-        if (level >= AI_SPEECH_CONTINUE_LEVEL) {
+        if (level >= continue_level) {
             silence_ms = 0;
         } else {
             silence_ms += chunk_ms;
@@ -1406,9 +1428,123 @@ static bool extract_output_text(cJSON *json, char *answer, size_t answer_len)
 
 #define AI_MAX_TOOL_ROUNDS 3
 
+/* ---- conversation memory: last turns sent as context, full log kept on SD ---- */
+
+#define AI_HISTORY_TURNS 6
+#define AI_HISTORY_PATH  "/sdcard/ai_history.txt"
+#define AI_HISTORY_RESET_MARK "=== CONVERSATIE NOUA ==="
+
+typedef struct {
+    char q[400];
+    char a[800];
+} ai_turn_t;
+
+static ai_turn_t *s_ai_hist;   /* ring buffer in PSRAM, AI_HISTORY_TURNS entries */
+static int s_ai_hist_count;
+static int s_ai_hist_head;     /* index of the oldest entry */
+
+static bool ai_hist_alloc(void)
+{
+    if (!s_ai_hist) {
+        s_ai_hist = heap_caps_calloc(AI_HISTORY_TURNS, sizeof(ai_turn_t), MALLOC_CAP_SPIRAM);
+    }
+    return s_ai_hist != NULL;
+}
+
+static void ai_hist_push(const char *q, const char *a)
+{
+    if (!ai_hist_alloc()) return;
+    int slot = (s_ai_hist_head + s_ai_hist_count) % AI_HISTORY_TURNS;
+    if (s_ai_hist_count == AI_HISTORY_TURNS) {
+        slot = s_ai_hist_head;
+        s_ai_hist_head = (s_ai_hist_head + 1) % AI_HISTORY_TURNS;
+    } else {
+        s_ai_hist_count++;
+    }
+    strlcpy(s_ai_hist[slot].q, q, sizeof(s_ai_hist[slot].q));
+    strlcpy(s_ai_hist[slot].a, a, sizeof(s_ai_hist[slot].a));
+}
+
+static void ai_hist_clear(void)
+{
+    s_ai_hist_count = 0;
+    s_ai_hist_head = 0;
+}
+
+static void one_line(char *s)
+{
+    for (; *s; s++) {
+        if (*s == '\n' || *s == '\r') *s = ' ';
+    }
+}
+
+static void ai_hist_log(const char *q, const char *a)
+{
+    FILE *f = fopen(AI_HISTORY_PATH, "a");
+    if (!f) return;
+    char stamp[32] = "";
+    time_t t = time(NULL);
+    struct tm lt;
+    localtime_r(&t, &lt);
+    if (lt.tm_year + 1900 >= 2024) {
+        strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M", &lt);
+    }
+    char *qq = strdup(q);
+    char *aa = strdup(a);
+    if (qq && aa) {
+        one_line(qq);
+        one_line(aa);
+        fprintf(f, "=== %s ===\nQ: %s\nA: %s\n", stamp, qq, aa);
+    }
+    free(qq);
+    free(aa);
+    fclose(f);
+}
+
+/* Rebuild the context ring from the log: the last turns after the last reset mark. */
+static void ai_hist_load(void)
+{
+    FILE *f = fopen(AI_HISTORY_PATH, "r");
+    if (!f || !ai_hist_alloc()) {
+        if (f) fclose(f);
+        return;
+    }
+    char *line = malloc(1200);
+    char *pending_q = malloc(sizeof(((ai_turn_t *)0)->q));
+    if (line && pending_q) {
+        pending_q[0] = '\0';
+        while (fgets(line, 1200, f)) {
+            char *p = trim(line);
+            if (strcmp(p, AI_HISTORY_RESET_MARK) == 0) {
+                ai_hist_clear();
+                pending_q[0] = '\0';
+            } else if (strncmp(p, "Q: ", 3) == 0) {
+                strlcpy(pending_q, p + 3, sizeof(((ai_turn_t *)0)->q));
+            } else if (strncmp(p, "A: ", 3) == 0 && pending_q[0]) {
+                ai_hist_push(pending_q, p + 3);
+                pending_q[0] = '\0';
+            }
+        }
+        ESP_LOGI(TAG, "AI history: %d turns restored", s_ai_hist_count);
+    }
+    free(line);
+    free(pending_q);
+    fclose(f);
+}
+
+static void ai_hist_reset(void)
+{
+    ai_hist_clear();
+    FILE *f = fopen(AI_HISTORY_PATH, "a");
+    if (f) {
+        fprintf(f, "%s\n", AI_HISTORY_RESET_MARK);
+        fclose(f);
+    }
+}
+
 static esp_err_t ai_chat_romanian(const char *question, char *answer, size_t answer_len)
 {
-    char sysmsg[300];
+    char sysmsg[420];
     char timestr[48] = "necunoscuta";
     time_t t = time(NULL);
     struct tm lt;
@@ -1419,6 +1555,7 @@ static esp_err_t ai_chat_romanian(const char *question, char *answer, size_t ans
     snprintf(sysmsg, sizeof(sysmsg),
              "Esti un asistent vocal pe un dispozitiv ESP32 aflat in Romania. Data si ora locala: %s. "
              "Raspunde concis, natural si numai in limba romana. "
+             "Continua firesc conversatia de mai jos daca intrebarea se leaga de ea. "
              "Pentru vreme sau curs valutar foloseste functiile disponibile.", timestr);
 
     cJSON *root = cJSON_CreateObject();
@@ -1429,6 +1566,17 @@ static esp_err_t ai_chat_romanian(const char *question, char *answer, size_t ans
     cJSON_AddStringToObject(sys, "role", "system");
     cJSON_AddStringToObject(sys, "content", sysmsg);
     cJSON_AddItemToArray(input, sys);
+    for (int i = 0; s_ai_hist && i < s_ai_hist_count; i++) {
+        const ai_turn_t *turn = &s_ai_hist[(s_ai_hist_head + i) % AI_HISTORY_TURNS];
+        cJSON *hq = cJSON_CreateObject();
+        cJSON_AddStringToObject(hq, "role", "user");
+        cJSON_AddStringToObject(hq, "content", turn->q);
+        cJSON_AddItemToArray(input, hq);
+        cJSON *ha = cJSON_CreateObject();
+        cJSON_AddStringToObject(ha, "role", "assistant");
+        cJSON_AddStringToObject(ha, "content", turn->a);
+        cJSON_AddItemToArray(input, ha);
+    }
     cJSON *usr = cJSON_CreateObject();
     cJSON_AddStringToObject(usr, "role", "user");
     cJSON_AddStringToObject(usr, "content", question);
@@ -1575,7 +1723,7 @@ static void ai_task(void *arg)
     ui_set_mode(UI_MODE_AI);
     ui_set_ai_phase(UI_AI_LISTENING);
     ui_set_title("Ascult...");
-    ui_set_subtitle("Vorbeste acum");
+    ui_set_subtitle("Vorbeste - ma opresc cand faci pauza");
     ui_set_status("Inregistrare");
     esp_err_t rec = ai_record_wav(AI_WAV_PATH);
     if (rec != ESP_OK) {
@@ -1608,6 +1756,8 @@ static void ai_task(void *arg)
         s_ai_task = NULL;
         vTaskDelete(NULL);
     }
+    ai_hist_push(question, answer);
+    ai_hist_log(question, answer);
 
     ui_set_title("Vorbesc...");
     ui_set_subtitle(s_ai_voices[s_ai_voice_index]);
@@ -2055,6 +2205,9 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
         "<option value='60'>1 minut</option><option value='120'>2 minute</option><option value='300'>5 minute</option></select>"
         "<label>Cheie OpenAI (<span id='keyst'>-</span>)</label>"
         "<div class='row'><input id='aikey' type='password' placeholder='sk-...'><button onclick='saveKey()'>Salveaza</button></div>"
+        "<label>Memoria asistentului AI</label>"
+        "<div class='row'><span class='mut' id='aimem' style='flex:1'>-</span>"
+        "<button class='alt2' onclick='aiReset()'>Conversatie noua</button></div>"
         "<div class='tiny' id='ipinfo'></div></section>"
         "<section><details><summary>Setari WiFi</summary><form method='post' action='/save'>"
         "<label>SSID</label><input name='ssid' maxlength='32' required>"
@@ -2108,7 +2261,10 @@ static esp_err_t web_root_get_handler(httpd_req_t *req)
         "function saveUrl(){post('/api/radio/save',{name:$('name').value,url:$('url').value},'Post salvat').then(loadStations);}"
         "async function loadSettings(){try{let s=await(await fetch('/api/settings')).json();"
         "$('saver').value=String(s.saver);$('keyst').textContent=s.ai_key_set?'setata':'nesetata';"
-        "$('ipinfo').textContent=s.ip?('Adresa dispozitivului: http://'+s.ip):'';}catch(e){}}"
+        "$('ipinfo').textContent=s.ip?('Adresa dispozitivului: http://'+s.ip):'';"
+        "$('aimem').textContent=s.ai_turns?('Isi aminteste ultimele '+s.ai_turns+' schimburi'):'Conversatie noua';}catch(e){}}"
+        "function aiReset(){if(confirm('Incepi o conversatie noua? Asistentul uita schimburile anterioare (jurnalul de pe card ramane).'))"
+        "post('/api/ai/reset','','Conversatie noua').then(()=>setTimeout(loadSettings,400));}"
         "function saveSaver(){post('/api/settings',{saver:$('saver').value},'Setare salvata');}"
         "function saveKey(){let k=$('aikey').value.trim();if(!k)return toast('Introdu cheia',1);"
         "post('/api/openai_key',{key:k},'Cheie salvata').then(loadSettings);$('aikey').value='';}"
@@ -2321,11 +2477,11 @@ static esp_err_t api_next_handler(httpd_req_t *req)
 
 static esp_err_t api_settings_get_handler(httpd_req_t *req)
 {
-    char buf[128];
-    snprintf(buf, sizeof(buf), "{\"saver\":%u,\"ai_key_set\":%s,\"ip\":\"%s\"}",
+    char buf[160];
+    snprintf(buf, sizeof(buf), "{\"saver\":%u,\"ai_key_set\":%s,\"ip\":\"%s\",\"ai_turns\":%d}",
              (unsigned)(s_saver_timeout_ms / 1000),
              s_openai_api_key[0] ? "true" : "false",
-             s_sta_ip);
+             s_sta_ip, s_ai_hist_count);
     httpd_resp_set_type(req, "application/json");
     return httpd_resp_sendstr(req, buf);
 }
@@ -2367,6 +2523,18 @@ static esp_err_t api_openai_key_handler(httpd_req_t *req)
     }
     fprintf(f, "key=%s\n", key);
     fclose(f);
+    return send_json_ok(req);
+}
+
+static esp_err_t api_ai_reset_handler(httpd_req_t *req)
+{
+    if (s_ai_task) {
+        return send_json_error(req, "asistentul raspunde acum, incearca imediat dupa");
+    }
+    int action = UI_ACTION_AI_RESET;
+    if (xQueueSend(s_action_queue, &action, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return send_json_error(req, "command queue full");
+    }
     return send_json_ok(req);
 }
 
@@ -2617,6 +2785,11 @@ static esp_err_t web_server_start(void)
         .method = HTTP_POST,
         .handler = api_openai_key_handler,
     };
+    const httpd_uri_t api_ai_reset = {
+        .uri = "/api/ai/reset",
+        .method = HTTP_POST,
+        .handler = api_ai_reset_handler,
+    };
     const httpd_uri_t api_mp3_delete = {
         .uri = "/api/mp3/delete",
         .method = HTTP_POST,
@@ -2670,6 +2843,7 @@ static esp_err_t web_server_start(void)
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_wifi_httpd, &api_settings_get), TAG, "register settings get");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_wifi_httpd, &api_settings_post), TAG, "register settings post");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_wifi_httpd, &api_openai_key), TAG, "register openai key");
+    ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_wifi_httpd, &api_ai_reset), TAG, "register ai reset");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_wifi_httpd, &api_mp3_delete), TAG, "register mp3 delete");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_wifi_httpd, &api_mp3_upload), TAG, "register mp3 upload");
     ESP_RETURN_ON_ERROR(httpd_register_uri_handler(s_wifi_httpd, &redirect), TAG, "register redirect");
@@ -3003,6 +3177,7 @@ void app_main(void)
         if (load_openai_key_from_sd()) {
             ESP_LOGI(TAG, "OpenAI API key loaded from SD card");
         }
+        ai_hist_load();
     } else {
         ui_set_status("Fara card SD");
     }

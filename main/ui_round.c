@@ -103,8 +103,8 @@ static void subtitle_tap_cb(lv_event_t *e)
 static void long_press_cb(lv_event_t *e)
 {
     (void)e;
-    if (s_current_mode == UI_MODE_AI || s_picker || s_saver) return;
-    send_action(UI_ACTION_OPEN_LIST);
+    if (s_picker || s_saver) return;
+    send_action(s_current_mode == UI_MODE_AI ? UI_ACTION_AI_RESET : UI_ACTION_OPEN_LIST);
 }
 
 static void screen_gesture_cb(lv_event_t *e)

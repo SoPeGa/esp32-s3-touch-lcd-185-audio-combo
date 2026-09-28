@@ -5,7 +5,8 @@ Aplicație ESP-IDF pentru kitul `ESP32-S3-Touch-LCD-1.85`, cu Internet Radio, pl
 ## Interfața pe ecran
 
 - Swipe stânga/dreapta comută între moduri: Radio → MP3 → Asistent AI (punctele de sub etichetă arată modul curent; tap pe etichetă face același lucru); intrarea în modul AI oprește redarea
-- Asistent AI cu avatar animat (ascultă/gândește/vorbește): apasă butonul central (microfon) și vorbește — înregistrarea pornește când începi să vorbești și se oprește singură la tăcere; tap pe numele vocii schimbă vocea TTS
+- Asistent AI cu avatar animat (ascultă/gândește/vorbește): apasă butonul central (microfon) și vorbește — înregistrarea pornește când începi să vorbești și durează cât vorbești (se oprește la o pauză de ~1,5 s, maxim 30 s); pragul de tăcere se adaptează la zgomotul din cameră; tap pe numele vocii schimbă vocea TTS
+- Asistentul ține minte ultimele 6 schimburi, deci poți continua conversația („și mâine?", „dar în Cluj?"); memoria supraviețuiește repornirii (jurnal complet în `/sdcard/ai_history.txt`). Long-press pe ecran în modul AI sau butonul „Conversatie noua" din web pornește o conversație de la zero
 - Asistentul poate verifica informații în timp real: vremea și prognoza pe 3 zile pentru orice localitate (Open-Meteo), cursul valutar (BCE/Frankfurter) și cunoaște data și ora locală — întreabă de ex. „Cum e vremea în Cluj?" sau „Cât e euro azi?"
 - Ceas sincronizat prin NTP (fus orar România), păstrat în RTC-ul PCF85063 peste reporniri
 - Baterie cu iconiță și procent, colorată după nivel (`--` fără baterie)
